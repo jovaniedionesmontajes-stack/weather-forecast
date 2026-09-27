@@ -12,15 +12,16 @@
     "dev:server": "node --watch server/index.js"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "latest",
-    "vite": "latest",
-    "react": "latest",
-    "react-dom": "latest",
-    "lucide-react": "latest",
-    "express": "latest",
-    "cors": "latest",
-    "dotenv": "latest",
-    "@supabase/supabase-js": "latest"
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "lucide-react": "^1.48.0",
+    "express": "^5.2.1",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.4",
+    "@supabase/supabase-js": "^2.117.2"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "vite": "^8.3.1",
+    "@vitejs/plugin-react": "^6.1.1"
+  }
 }
