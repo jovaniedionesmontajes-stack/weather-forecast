@@ -29,6 +29,13 @@ const serviceRole = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const supabase = supabaseUrl && serviceRole ? createClient(supabaseUrl, serviceRole) : null;
 const authRequired = String(process.env.AUTH_REQUIRED || 'false').toLowerCase() === 'true';
 
+// PATCH 4: pahimangno kon walay auth sa production. Ang requireRole() motugot sa tanan
+// kon AUTH_REQUIRED wala ma-set. Usba ang console.warn ngadto sa `throw new Error(...)`
+// kon sigurado ka na nga naka-set na ang AUTH_REQUIRED=true ug mo-work ang login.
+if (process.env.NODE_ENV === 'production' && !authRequired) {
+  console.warn('[SECURITY] AUTH_REQUIRED is not "true" in production. Admin/manager routes are open to everyone.');
+}
+
 async function authenticate(req, res, next) {
   if (!authRequired) return next();
   if (!supabase) return res.status(503).json({ error: 'Authentication requires Supabase configuration.' });
@@ -82,12 +89,23 @@ async function fetchWeather(branch) {
   return response.json();
 }
 
+// PATCH 1: Timezone fix.
+// Open-Meteo returns local time without an offset ("2026-09-28T14:00"). Parsing that with
+// new Date() on a UTC server (Vercel) shifts everything by the branch's UTC offset.
+// Use utc_offset_seconds from the response to convert to a true UTC ISO string.
+function toUtcIso(localTime, offsetSeconds = 0) {
+  const ms = Date.parse(localTime.endsWith('Z') ? localTime : `${localTime}Z`);
+  if (Number.isNaN(ms)) return null;
+  return new Date(ms - offsetSeconds * 1000).toISOString();
+}
+
 function forecastRows(branch, weather, runTime = new Date().toISOString()) {
   const h = weather.hourly;
+  const offset = weather.utc_offset_seconds ?? 0;
   return h.time.map((forecastTime, i) => ({
     branch_id: branch.id,
     forecast_run_time: runTime,
-    forecast_time: new Date(forecastTime).toISOString(),
+    forecast_time: toUtcIso(forecastTime, offset),
     temperature_c: h.temperature_2m?.[i] ?? null,
     apparent_temperature_c: h.apparent_temperature?.[i] ?? null,
     humidity_pct: h.relative_humidity_2m?.[i] ?? null,
@@ -103,66 +121,190 @@ function forecastRows(branch, weather, runTime = new Date().toISOString()) {
   }));
 }
 
+// PATCH 3: Accuracy with lead-time buckets, POD/FAR, Brier Skill Score, sample size.
 
+const RAIN_THRESHOLD_PCT = 50;      // >= this = "forecast says rain"
+const MIN_SAMPLE = 30;              // below this, percentages are not reliable yet
+const MATCH_TOLERANCE_MS = 30 * 60 * 1000; // hourly data, so +/- 30 min at most
+const HEADLINE_BUCKET = '6-24h';    // used for the legacy fields the frontend already reads
+const HOUR_MS = 60 * 60 * 1000;
 
-function classifyRainMatch(rainProbability, didRain) {
-  if (rainProbability == null) return 'unknown';
-  const predictedRain = Number(rainProbability) >= 50;
-  return predictedRain === Boolean(didRain) ? 'match' : 'mismatch';
+const LEAD_BUCKETS = [
+  { key: '0-6h',   min: 0,  max: 6 },
+  { key: '6-24h',  min: 6,  max: 24 },
+  { key: '24-48h', min: 24, max: 48 },
+  { key: '48h+',   min: 48, max: Infinity }
+];
+
+const bucketFor = lead => LEAD_BUCKETS.find(b => lead >= b.min && lead < b.max)?.key ?? null;
+
+// Supabase/PostgREST caps responses at 1000 rows by default, so .limit(5000) silently
+// truncates. Paginate to get everything.
+async function fetchAll(buildQuery, pageSize = 1000, maxRows = 50000) {
+  const rows = [];
+  for (let from = 0; from < maxRows; from += pageSize) {
+    const { data, error } = await buildQuery().range(from, from + pageSize - 1);
+    if (error) throw error;
+    rows.push(...(data || []));
+    if (!data || data.length < pageSize) break;
+  }
+  return rows;
+}
+
+function classifyRainMatch(rainProbabilityPct, didRain) {
+  if (rainProbabilityPct == null) return 'unknown';
+  const predicted = Number(rainProbabilityPct) >= RAIN_THRESHOLD_PCT;
+  return predicted === Boolean(didRain) ? 'match' : 'mismatch';
+}
+
+const mean = arr => arr.reduce((a, b) => a + b, 0) / arr.length;
+const round = (v, d = 2) => Number(v.toFixed(d));
+
+function summarize(recs) {
+  const n = recs.length;
+  const withProb = recs.filter(r => r.forecast_rain_probability_pct != null);
+  let hits = 0, misses = 0, falseAlarms = 0, correctNegatives = 0;
+  for (const r of withProb) {
+    const predicted = Number(r.forecast_rain_probability_pct) >= RAIN_THRESHOLD_PCT;
+    if (predicted && r.did_rain) hits++;
+    else if (!predicted && r.did_rain) misses++;
+    else if (predicted && !r.did_rain) falseAlarms++;
+    else correctNegatives++;
+  }
+  const np = withProb.length;
+  const rainEvents = hits + misses;
+
+  // Brier Skill Score vs. climatology (always forecasting the observed rain frequency).
+  // BSS > 0 = better than guessing the base rate; BSS <= 0 = no added value in this sample.
+  const brier = np ? mean(withProb.map(r => r.brier_score)) : null;
+  const baseRate = np ? rainEvents / np : null;
+  const brierRef = baseRate == null ? null : baseRate * (1 - baseRate);
+  const bss = brier != null && brierRef > 0 ? 1 - brier / brierRef : null;
+
+  const tempErrors = recs.map(r => r.temperature_error_c).filter(v => v != null);
+
+  return {
+    n,
+    n_with_probability: np,
+    sufficient_sample: np >= MIN_SAMPLE,
+    rain_events: rainEvents,
+    dry_events: np - rainEvents,
+    hits, misses, false_alarms: falseAlarms, correct_negatives: correctNegatives,
+    rain_match_rate_pct: np ? Math.round(((hits + correctNegatives) / np) * 100) : null,
+    pod_pct: rainEvents ? Math.round((hits / rainEvents) * 100) : null,
+    far_pct: hits + falseAlarms ? Math.round((falseAlarms / (hits + falseAlarms)) * 100) : null,
+    observed_rain_rate_pct: baseRate == null ? null : Math.round(baseRate * 100),
+    brier_score: brier == null ? null : round(brier, 4),
+    brier_skill_score: bss == null ? null : round(bss, 3),
+    mean_absolute_temperature_error_c: tempErrors.length ? round(mean(tempErrors.map(Math.abs))) : null,
+    temperature_bias_c: tempErrors.length ? round(mean(tempErrors)) : null // + = forecast runs too warm
+  };
 }
 
 async function calculateAccuracy(branchId) {
-  const [{ data: observations, error: obsError }, { data: forecasts, error: fcError }] = await Promise.all([
-    supabase.from('weather_observations').select('*').eq('branch_id', branchId).order('observation_time', { ascending: false }).limit(1000),
-    supabase.from('weather_forecasts').select('*').eq('branch_id', branchId).order('forecast_run_time', { ascending: false }).limit(5000)
-  ]);
-  if (obsError) throw obsError;
-  if (fcError) throw fcError;
+  const observations = await fetchAll(() =>
+    supabase.from('weather_observations').select('*')
+      .eq('branch_id', branchId)
+      .order('observation_time', { ascending: false })
+      .order('id')
+  );
 
-  const matches = [];
-  for (const observation of observations || []) {
-    const target = new Date(observation.observation_time).getTime();
-    const candidates = (forecasts || []).filter(f => {
-      const ft = new Date(f.forecast_time).getTime();
-      const run = new Date(f.forecast_run_time).getTime();
-      return run <= target && Math.abs(ft - target) <= 90 * 60 * 1000;
-    });
-    candidates.sort((a, b) => Math.abs(new Date(a.forecast_time).getTime() - target) - Math.abs(new Date(b.forecast_time).getTime() - target));
-    const forecast = candidates[0];
-    if (!forecast) continue;
+  let minT = Infinity, maxT = -Infinity;
+  for (const o of observations) {
+    const t = Date.parse(o.observation_time);
+    if (Number.isFinite(t)) { minT = Math.min(minT, t); maxT = Math.max(maxT, t); }
+  }
+  const forecasts = Number.isFinite(minT)
+    ? await fetchAll(() =>
+        supabase.from('weather_forecasts').select('*')
+          .eq('branch_id', branchId)
+          .gte('forecast_time', new Date(minT - HOUR_MS).toISOString())
+          .lte('forecast_time', new Date(maxT + HOUR_MS).toISOString())
+          .order('forecast_time')
+          .order('forecast_run_time')
+      )
+    : [];
 
-    const probability = forecast.rain_probability_pct == null ? null : Number(forecast.rain_probability_pct) / 100;
-    const outcome = observation.did_rain ? 1 : 0;
-    const tempError = observation.actual_temperature_c == null || forecast.temperature_c == null
-      ? null
-      : Math.abs(Number(observation.actual_temperature_c) - Number(forecast.temperature_c));
-    matches.push({
-      observation_id: observation.id,
-      observation_time: observation.observation_time,
-      forecast_time: forecast.forecast_time,
-      forecast_run_time: forecast.forecast_run_time,
-      forecast_temperature_c: forecast.temperature_c,
-      actual_temperature_c: observation.actual_temperature_c,
-      forecast_rain_probability_pct: forecast.rain_probability_pct,
-      did_rain: observation.did_rain,
-      rain_result: classifyRainMatch(forecast.rain_probability_pct, observation.did_rain),
-      temperature_absolute_error_c: tempError,
-      brier_score: probability == null ? null : Math.pow(probability - outcome, 2)
-    });
+  const byHour = new Map();
+  for (const f of forecasts) {
+    const ftMs = Date.parse(f.forecast_time);
+    const runMs = Date.parse(f.forecast_run_time);
+    if (!Number.isFinite(ftMs) || !Number.isFinite(runMs)) continue;
+    const key = Math.floor(ftMs / HOUR_MS);
+    if (!byHour.has(key)) byHour.set(key, []);
+    byHour.get(key).push({ f, ftMs, runMs });
   }
 
-  const comparable = matches.filter(m => m.rain_result !== 'unknown');
-  const matched = comparable.filter(m => m.rain_result === 'match').length;
-  const temperatureErrors = matches.map(m => m.temperature_absolute_error_c).filter(v => v != null);
-  const brierScores = matches.map(m => m.brier_score).filter(v => v != null);
+  const recordsByBucket = Object.fromEntries(LEAD_BUCKETS.map(b => [b.key, []]));
+  let matchedObservations = 0;
+
+  for (const observation of observations) {
+    const target = Date.parse(observation.observation_time);
+    if (!Number.isFinite(target)) continue;
+    const base = Math.floor(target / HOUR_MS);
+
+    const bestPerBucket = new Map();
+    for (const k of [base - 1, base, base + 1]) {
+      for (const c of byHour.get(k) || []) {
+        if (c.runMs > target) continue; // a forecast made after the observation doesn't count
+        const distance = Math.abs(c.ftMs - target);
+        if (distance > MATCH_TOLERANCE_MS) continue;
+        const lead = (c.ftMs - c.runMs) / HOUR_MS;
+        if (lead < 0) continue;
+        const bucket = bucketFor(lead);
+        if (!bucket) continue;
+        const cur = bestPerBucket.get(bucket);
+        if (!cur || distance < cur.distance || (distance === cur.distance && c.runMs > cur.runMs)) {
+          bestPerBucket.set(bucket, { ...c, distance, lead });
+        }
+      }
+    }
+    if (bestPerBucket.size) matchedObservations++;
+
+    for (const [bucket, { f, lead }] of bestPerBucket) {
+      const probPct = f.rain_probability_pct == null ? null : Number(f.rain_probability_pct);
+      const outcome = observation.did_rain ? 1 : 0;
+      const fTemp = f.temperature_c == null ? null : Number(f.temperature_c);
+      const aTemp = observation.actual_temperature_c == null ? null : Number(observation.actual_temperature_c);
+      recordsByBucket[bucket].push({
+        observation_id: observation.id,
+        observation_time: observation.observation_time,
+        forecast_time: f.forecast_time,
+        forecast_run_time: f.forecast_run_time,
+        lead_hours: round(lead, 1),
+        forecast_temperature_c: fTemp,
+        actual_temperature_c: aTemp,
+        forecast_rain_probability_pct: probPct,
+        did_rain: observation.did_rain,
+        rain_result: classifyRainMatch(probPct, observation.did_rain),
+        temperature_error_c: fTemp == null || aTemp == null ? null : round(fTemp - aTemp), // forecast - actual
+        brier_score: probPct == null ? null : Math.pow(probPct / 100 - outcome, 2)
+      });
+    }
+  }
+
+  const by_lead = {};
+  for (const b of LEAD_BUCKETS) by_lead[b.key] = summarize(recordsByBucket[b.key]);
+
+  // Legacy field names kept so the existing frontend and /api/reports/overview keep working,
+  // but they now come from ONE lead bucket instead of a mix of lead times.
+  const head = by_lead[HEADLINE_BUCKET];
   return {
-    total_observations: observations?.length || 0,
-    matched_rain_predictions: matched,
-    comparable_rain_predictions: comparable.length,
-    rain_match_rate_pct: comparable.length ? Math.round((matched / comparable.length) * 100) : null,
-    mean_absolute_temperature_error_c: temperatureErrors.length ? Number((temperatureErrors.reduce((a,b) => a+b,0) / temperatureErrors.length).toFixed(2)) : null,
-    brier_score: brierScores.length ? Number((brierScores.reduce((a,b) => a+b,0) / brierScores.length).toFixed(4)) : null,
-    records: matches.slice(0, 200)
+    total_observations: observations.length,
+    matched_observations: matchedObservations,
+    unmatched_observations: observations.length - matchedObservations,
+    headline_bucket: HEADLINE_BUCKET,
+    min_sample: MIN_SAMPLE,
+    sufficient_sample: head.sufficient_sample,
+    matched_rain_predictions: head.hits + head.correct_negatives,
+    comparable_rain_predictions: head.n_with_probability,
+    rain_match_rate_pct: head.rain_match_rate_pct,
+    mean_absolute_temperature_error_c: head.mean_absolute_temperature_error_c,
+    brier_score: head.brier_score,
+    by_lead,
+    records: recordsByBucket[HEADLINE_BUCKET]
+      .sort((a, b) => Date.parse(b.observation_time) - Date.parse(a.observation_time))
+      .slice(0, 200)
   };
 }
 
@@ -190,14 +332,23 @@ app.use('/api', (req,res,next) => publicApiPaths.has(req.path) ? next() : authen
 
 app.get('/api/me', authenticate, async (req,res) => res.json({ user: req.user ? { id:req.user.id,email:req.user.email } : null, profile:req.profile || null }));
 
+// PATCH 1 (cont.): times are converted to true UTC, and only upcoming hours are considered.
+// The old slice(0, 24) took 00:00-23:00 of the current local day, including hours already past.
 function rainRiskWindows(weather, hours = 24) {
   const h = weather?.hourly;
   if (!h?.time) return [];
-  const rows = h.time.slice(0, hours).map((time, i) => ({
-    time, prob: Number(h.precipitation_probability?.[i] ?? 0),
-    code: h.weather_code?.[i] ?? null,
-    rain: Number(h.rain?.[i] ?? 0)
-  }));
+  const offset = weather.utc_offset_seconds ?? 0;
+  const now = Date.now();
+  const rows = h.time
+    .map((time, i) => ({
+      time: toUtcIso(time, offset),
+      prob: Number(h.precipitation_probability?.[i] ?? 0),
+      code: h.weather_code?.[i] ?? null,
+      rain: Number(h.rain?.[i] ?? 0)
+    }))
+    .filter(r => r.time && Date.parse(r.time) >= now - HOUR_MS)
+    .slice(0, hours);
+
   const windows = [];
   let active = null;
   for (const row of rows) {
@@ -215,18 +366,22 @@ function alertSeverity(peakProbability) {
   return Number(peakProbability) >= 80 ? 'high' : 'watch';
 }
 
+// PATCH 2: compare alert windows as timestamps, not raw strings. Postgres returns
+// "...+00:00" while JS uses "...Z", so === never matched and every alert was cleared.
 async function refreshPersistentAlerts() {
   if (!supabase) throw new Error('Supabase is not configured.');
   const { data: branches, error: branchError } = await supabase.from('branches').select('*').eq('is_active', true);
   if (branchError) throw branchError;
   const now = new Date().toISOString();
-  const seenKeys = [];
+  const seen = new Set();
+  const keyOf = (branchId, alertKey, windowStart) => `${branchId}|${alertKey}|${Date.parse(windowStart)}`;
+
   for (const branch of branches || []) {
     const weather = await fetchWeather(branch);
     for (const window of rainRiskWindows(weather)) {
       const peak = Number(window.peak.prob);
       const severity = alertSeverity(peak);
-      const alertKey = `${severity}:${new Date(window.start).toISOString()}`;
+      const alertKey = `${severity}:${window.start}`;
       const payload = {
         branch_id: branch.id, alert_key: alertKey, severity, threshold_pct: 50,
         peak_probability_pct: peak, peak_time: window.peak.time,
@@ -236,17 +391,17 @@ async function refreshPersistentAlerts() {
       };
       const { error } = await supabase.from('weather_alerts').upsert(payload, { onConflict: 'branch_id,alert_key,window_start' });
       if (error) throw error;
-      seenKeys.push({ branch_id: branch.id, alert_key: alertKey, window_start: window.start });
+      seen.add(keyOf(branch.id, alertKey, window.start));
     }
   }
   const { data: openAlerts, error: openError } = await supabase.from('weather_alerts').select('id,branch_id,alert_key,window_start').eq('status','open');
   if (openError) throw openError;
   for (const alert of openAlerts || []) {
-    if (!seenKeys.some(x => x.branch_id === alert.branch_id && x.alert_key === alert.alert_key && x.window_start === alert.window_start)) {
+    if (!seen.has(keyOf(alert.branch_id, alert.alert_key, alert.window_start))) {
       await supabase.from('weather_alerts').update({ status:'cleared', cleared_at:now, last_seen_at:now }).eq('id', alert.id);
     }
   }
-  return { checked_branches: (branches || []).length, open_alerts: seenKeys.length, refreshed_at: now };
+  return { checked_branches: (branches || []).length, open_alerts: seen.size, refreshed_at: now };
 }
 
 app.get('/api/alerts/history', async (req, res) => {
@@ -455,6 +610,7 @@ app.get('/api/reports/overview', async (_req, res) => {
     res.json({
       generated_at: new Date().toISOString(),
       overall_rain_match_rate_pct: totalComparable ? Math.round(totalMatched / totalComparable * 100) : null,
+      overall_sufficient_sample: totalComparable >= MIN_SAMPLE,
       total_observations: reports.reduce((sum, r) => sum + r.total_observations, 0),
       branches: reports
     });
